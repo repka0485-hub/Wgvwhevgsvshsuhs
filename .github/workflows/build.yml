@@ -11,7 +11,7 @@ permissions:
 
 env:
   IMGUI_REF: v1.91.9      # pinned tag
-  DOBBY_REF: master       # floating on purpose; pin to the SHA from third-party-revisions.txt after the first green build
+  DOBBY_REF: 5dfc8546954ce3b3198132ab13fddb89ee92cdd7   # commit the upstream 'latest' release was built from (14 Mar); master HEAD has headers/sources out of sync
   ANDROID_ABI: arm64-v8a
   ANDROID_PLATFORM: android-24
 
@@ -51,7 +51,11 @@ jobs:
           cd "$PROJECT_DIR"
           mkdir -p third_party
           git clone --depth 1 --branch "$IMGUI_REF" https://github.com/ocornut/imgui.git third_party/imgui
-          git clone --depth 1 --branch "$DOBBY_REF" https://github.com/jmpews/Dobby.git third_party/Dobby
+          # fetch-by-ref works for SHA, tag and branch alike
+          git init -q third_party/Dobby
+          git -C third_party/Dobby remote add origin https://github.com/jmpews/Dobby.git
+          git -C third_party/Dobby fetch -q --depth 1 origin "$DOBBY_REF"
+          git -C third_party/Dobby checkout -q FETCH_HEAD
           git -C third_party/Dobby submodule update --init --depth 1 || true
           {
             echo "imgui $(git -C third_party/imgui rev-parse HEAD) ($IMGUI_REF)"
