@@ -64,6 +64,35 @@ jobs:
           test -f third_party/imgui/backends/imgui_impl_opengl3.cpp
           test -f third_party/Dobby/include/dobby.h
 
+      - name: Patch Dobby Linux/Android sources (stale after upstream refactors)
+        run: |
+          cd "$PROJECT_DIR/third_party/Dobby"
+          # Each edit: file, sed expression, grep pattern, expected pre-patch match count.
+          # A count mismatch means the pinned revision changed: fail instead of patching blindly.
+          patch_one() {
+            local file="$1" expr="$2" pat="$3" want="$4" got
+            test -f "$file" || { echo "::error::$file not found"; exit 1; }
+            got=$(grep -c -E "$pat" "$file" || true)
+            echo "$file: '$pat' matches=$got (expected $want)"
+            [ "$got" = "$want" ] || { echo "::error::unexpected match count in $file"; exit 1; }
+            sed -i -E "$expr" "$file"
+            ! grep -q -E "$pat" "$file" || { echo "::error::pattern still present in $file"; exit 1; }
+          }
+          PR=source/Backend/UserMode/PlatformUtil/Linux/ProcessRuntime.cc
+          # MemRange::start is a method since a513555; RuntimeModule::load_address was renamed to ::base
+          patch_one "$PR" 's/a\.start < b\.start/a.start() < b.start()/'  'a\.start < b\.start' 1
+          patch_one "$PR" 's/module\.load_address/module.base/g'            'module\.load_address' 3
+          # core/arch/Cpu.h no longer exists; ClearCache() is declared via dobby/dobby_internal.h
+          patch_one source/Backend/UserMode/ExecMemory/code-patch-tool-posix.cc \
+            '/^#include "core\/arch\/Cpu\.h"$/d' '^#include "core/arch/Cpu\.h"$' 1
+          test -f source/core/arch/Cpu.h && { echo "::error::Cpu.h exists now; drop this patch"; exit 1; } || true
+          # gettimeofday needs <sys/time.h> on bionic
+          L=external/logging/logging.cc
+          [ "$(grep -c -E '^#include <time\.h>$' "$L")" = 1 ] || { echo "::error::time.h anchor not unique in $L"; exit 1; }
+          grep -q '^#include <sys/time\.h>$' "$L" || sed -i -E 's/^#include <time\.h>$/#include <time.h>\n#include <sys\/time.h>/' "$L"
+          grep -q '^#include <sys/time.h>' external/logging/logging.cc || { echo "::error::sys/time.h not added"; exit 1; }
+          git diff --stat
+
       - name: Patch Dobby arm64 closure bridge (Mach-O @PAGE syntax -> ELF)
         run: |
           cd "$PROJECT_DIR"
@@ -107,6 +136,7 @@ jobs:
             -DANDROID_ABI="$ANDROID_ABI" \
             -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
             -DANDROID_STL=c++_static \
+            -DPlugin.SymbolResolver=OFF \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
