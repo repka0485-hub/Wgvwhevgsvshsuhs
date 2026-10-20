@@ -91,6 +91,15 @@ jobs:
           [ "$(grep -c -E '^#include <time\.h>$' "$L")" = 1 ] || { echo "::error::time.h anchor not unique in $L"; exit 1; }
           grep -q '^#include <sys/time\.h>$' "$L" || sed -i -E 's/^#include <time\.h>$/#include <time.h>\n#include <sys\/time.h>/' "$L"
           grep -q '^#include <sys/time.h>' external/logging/logging.cc || { echo "::error::sys/time.h not added"; exit 1; }
+          # include cycle platform.h -> common.h -> os_arch_features.h -> platform.h: under ANDROID the inline body
+          # uses OSMemory/kReadExecute before they are declared. Keep a declaration in os_arch_features.h and
+          # define the function at the end of platform.h (valid for either include order).
+          OA=common/os_arch_features.h; PH=source/PlatformUnifiedInterface/platform.h
+          [ "$(grep -c -E '^inline void make_memory_readable\(void \*address, size_t size\) \{$' "$OA")" = 1 ] || { echo "::error::make_memory_readable not found once in $OA"; exit 1; }
+          grep -q 'make_memory_readable' "$PH" && { echo "::error::$PH already defines make_memory_readable"; exit 1; } || true
+          sed -i -E '/^inline void make_memory_readable\(void \*address, size_t size\) \{$/,/^\}$/c\inline void make_memory_readable(void *address, size_t size);' "$OA"
+          grep -n 'make_memory_readable' "$OA"
+          printf '\n\nnamespace features {\nnamespace android {\ninline void make_memory_readable(void *address, size_t size) {\n#if defined(ANDROID)\n  auto page = (void *)ALIGN_FLOOR(address, OSMemory::PageSize());\n  if (!OSMemory::SetPermission(page, OSMemory::PageSize(), kReadExecute)) {\n    return;\n  }\n#endif\n}\n} // namespace android\n} // namespace features\n' >> "$PH"
           git diff --stat
 
       - name: Patch Dobby arm64 closure bridge (Mach-O @PAGE syntax -> ELF)
