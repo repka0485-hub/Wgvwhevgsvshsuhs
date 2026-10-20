@@ -1,0 +1,129 @@
+name: build-espmod
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMGUI_REF: v1.91.9      # pinned tag
+  DOBBY_REF: master       # floating on purpose; pin to the SHA from third-party-revisions.txt after the first green build
+  ANDROID_ABI: arm64-v8a
+  ANDROID_PLATFORM: android-24
+
+jobs:
+  android-arm64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project archive (sources uploaded as .zip)
+        run: |
+          if ! find . -maxdepth 4 -name CMakeLists.txt -not -path './.git/*' | grep -q .; then
+            ZIP=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -n1)
+            if [ -n "$ZIP" ]; then
+              echo "no CMakeLists.txt in tree; unpacking $ZIP"
+              mkdir -p _unpacked
+              unzip -q -o "$ZIP" -d _unpacked
+            fi
+          fi
+
+      - name: Locate project root
+        run: |
+          CML=$(find . -maxdepth 4 -name CMakeLists.txt -not -path './.git/*' -not -path '*/third_party/*' \
+                | awk -F/ '{print NF, $0}' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$CML" ] || [ ! -f "$(dirname "$CML")/src/main.cpp" ]; then
+            echo "::error::project root (CMakeLists.txt + src/main.cpp) not found; repository files:"
+            find . -not -path './.git/*' -type f | head -60
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$CML")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "project root: $PROJECT_DIR"
+
+      - name: Fetch third-party sources
+        run: |
+          cd "$PROJECT_DIR"
+          mkdir -p third_party
+          git clone --depth 1 --branch "$IMGUI_REF" https://github.com/ocornut/imgui.git third_party/imgui
+          git clone --depth 1 --branch "$DOBBY_REF" https://github.com/jmpews/Dobby.git third_party/Dobby
+          git -C third_party/Dobby submodule update --init --depth 1 || true
+          {
+            echo "imgui $(git -C third_party/imgui rev-parse HEAD) ($IMGUI_REF)"
+            echo "Dobby $(git -C third_party/Dobby rev-parse HEAD) ($DOBBY_REF)"
+          } | tee third-party-revisions.txt
+          test -f third_party/imgui/backends/imgui_impl_opengl3.cpp
+          test -f third_party/Dobby/include/dobby.h
+
+      - name: Patch Dobby arm64 closure bridge (Mach-O @PAGE syntax -> ELF)
+        run: |
+          cd "$PROJECT_DIR"
+          ASM=third_party/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
+          test -f "$ASM" || { echo "::error::$ASM not found; Dobby layout changed"; exit 1; }
+          SYM=common_closure_bridge_handler
+          N_PAGE=$(grep -c -E "^[[:space:]]*adrp[[:space:]]+x17,[[:space:]]*${SYM}@PAGE[[:space:]]*$" "$ASM" || true)
+          N_OFF=$(grep -c -E "^[[:space:]]*add[[:space:]]+x17,[[:space:]]*x17,[[:space:]]*${SYM}@PAGEOFF[[:space:]]*$" "$ASM" || true)
+          echo "match count: @PAGE=$N_PAGE @PAGEOFF=$N_OFF (expected 1/1, or 0/0 if upstream already fixed)"
+          if [ "$N_PAGE" = 0 ] && [ "$N_OFF" = 0 ]; then
+            grep -q '@PAGE' "$ASM" && { echo "::error::unrecognised @PAGE usage remains"; grep -n '@PAGE' "$ASM"; exit 1; }
+            echo "nothing to patch"
+          elif [ "$N_PAGE" = 1 ] && [ "$N_OFF" = 1 ]; then
+            # ELF: ADRP page + :lo12: low bits; .hidden keeps the reference non-preemptible inside the DSO
+            sed -i -E \
+              -e "s/^([[:space:]]*)adrp([[:space:]]+)x17,[[:space:]]*${SYM}@PAGE[[:space:]]*$/\1.hidden ${SYM}\n\1adrp\2x17, ${SYM}/" \
+              -e "s/^([[:space:]]*add[[:space:]]+x17,[[:space:]]*x17,[[:space:]]*)${SYM}@PAGEOFF[[:space:]]*$/\1:lo12:${SYM}/" \
+              "$ASM"
+            ! grep -q '@PAGE' "$ASM" || { echo "::error::@PAGE still present after patch"; exit 1; }
+            grep -n -B1 -A1 "$SYM" "$ASM"
+          else
+            echo "::error::unexpected match counts; refusing to patch blindly"; grep -n '@PAGE' "$ASM"; exit 1
+          fi
+
+      - name: Locate NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          test -d "$NDK" || { echo "::error::NDK not found on runner"; exit 1; }
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "NDK path: $NDK"; cat "$NDK/source.properties" | head -3
+
+      - name: Configure
+        run: |
+          cd "$PROJECT_DIR"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ANDROID_ABI" \
+            -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cd "$PROJECT_DIR"
+          cmake --build build -j"$(nproc)"
+
+      - name: Verify artifact
+        run: |
+          cd "$PROJECT_DIR"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          SO=build/libespmod.so
+          test -f "$SO"
+          "$BIN/llvm-readelf" -h "$SO" | grep -E 'Class|Machine'
+          "$BIN/llvm-readelf" -h "$SO" | grep -q 'AArch64'
+          "$BIN/llvm-readelf" -d "$SO" | grep NEEDED
+          # unresolved libs outside the Android system set would fail at dlopen
+          "$BIN/llvm-readelf" -d "$SO" | grep NEEDED | grep -Ev 'liblog|libEGL|libGLESv3|libandroid|libdl|libc\.so|libm\.so' && { echo "::error::unexpected NEEDED entry"; exit 1; } || true
+          sha256sum "$SO" | tee build/libespmod.so.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: espmod-arm64-v8a
+          path: |
+            ${{ env.PROJECT_DIR }}/build/libespmod.so
+            ${{ env.PROJECT_DIR }}/build/libespmod.so.sha256
+            ${{ env.PROJECT_DIR }}/third-party-revisions.txt
+          if-no-files-found: error
