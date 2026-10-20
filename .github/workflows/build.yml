@@ -65,21 +65,25 @@ jobs:
           cd "$PROJECT_DIR"
           ASM=third_party/Dobby/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm
           test -f "$ASM" || { echo "::error::$ASM not found; Dobby layout changed"; exit 1; }
-          SYM=common_closure_bridge_handler
-          N_PAGE=$(grep -c -E "^[[:space:]]*adrp[[:space:]]+x17,[[:space:]]*${SYM}@PAGE[[:space:]]*$" "$ASM" || true)
-          N_OFF=$(grep -c -E "^[[:space:]]*add[[:space:]]+x17,[[:space:]]*x17,[[:space:]]*${SYM}@PAGEOFF[[:space:]]*$" "$ASM" || true)
+          echo "--- macro definitions in $ASM:"; grep -n -E '#[[:space:]]*(define|if|ifdef|ifndef|else|endif|include)' "$ASM" || true
+          # operand forms seen in the failing log: "<reg>, cdecl(sym)@PAGE" / "<reg>, <reg>, cdecl(sym)@PAGEOFF"
+          SYM='cdecl\(common_closure_bridge_handler\)'
+          RE_PAGE="^([[:space:]]*)adrp([[:space:]]+)([A-Za-z0-9_]+),[[:space:]]*(${SYM})@PAGE[[:space:]]*$"
+          RE_OFF="^([[:space:]]*add[[:space:]]+)([A-Za-z0-9_]+),[[:space:]]*([A-Za-z0-9_]+),[[:space:]]*(${SYM})@PAGEOFF[[:space:]]*$"
+          N_PAGE=$(grep -c -E "$RE_PAGE" "$ASM" || true)
+          N_OFF=$(grep -c -E "$RE_OFF" "$ASM" || true)
           echo "match count: @PAGE=$N_PAGE @PAGEOFF=$N_OFF (expected 1/1, or 0/0 if upstream already fixed)"
           if [ "$N_PAGE" = 0 ] && [ "$N_OFF" = 0 ]; then
-            grep -q '@PAGE' "$ASM" && { echo "::error::unrecognised @PAGE usage remains"; grep -n '@PAGE' "$ASM"; exit 1; }
+            if grep -q '@PAGE' "$ASM"; then echo "::error::unrecognised @PAGE usage remains"; grep -n '@PAGE' "$ASM"; exit 1; fi
             echo "nothing to patch"
           elif [ "$N_PAGE" = 1 ] && [ "$N_OFF" = 1 ]; then
             # ELF: ADRP page + :lo12: low bits; .hidden keeps the reference non-preemptible inside the DSO
             sed -i -E \
-              -e "s/^([[:space:]]*)adrp([[:space:]]+)x17,[[:space:]]*${SYM}@PAGE[[:space:]]*$/\1.hidden ${SYM}\n\1adrp\2x17, ${SYM}/" \
-              -e "s/^([[:space:]]*add[[:space:]]+x17,[[:space:]]*x17,[[:space:]]*)${SYM}@PAGEOFF[[:space:]]*$/\1:lo12:${SYM}/" \
+              -e "s/${RE_PAGE}/\\1.hidden \\4\\n\\1adrp\\2\\3, \\4/" \
+              -e "s/${RE_OFF}/\\1\\2, \\3, :lo12:\\4/" \
               "$ASM"
-            ! grep -q '@PAGE' "$ASM" || { echo "::error::@PAGE still present after patch"; exit 1; }
-            grep -n -B1 -A1 "$SYM" "$ASM"
+            if grep -q '@PAGE' "$ASM"; then echo "::error::@PAGE still present after patch"; exit 1; fi
+            echo "--- patched region:"; grep -n -B1 -A1 'common_closure_bridge_handler' "$ASM"
           else
             echo "::error::unexpected match counts; refusing to patch blindly"; grep -n '@PAGE' "$ASM"; exit 1
           fi
